@@ -7,6 +7,7 @@ use core::panic;
 
 use alloc::{vec, vec::Vec};
 use pliron_derive::op_interface;
+use smallvec::SmallVec;
 
 use crate::{
     basic_block::BasicBlock,
@@ -189,6 +190,34 @@ fn prune_candidates(candidates: &mut Vec<AllocCandidate>, ctx: &Context) {
             })
         })
     });
+}
+
+/// Maps each candidate's allocation pointer to its position in the candidate slice.
+struct CandidateIndex(HMap<Value, usize>);
+
+impl CandidateIndex {
+    fn new(candidates: &[AllocCandidate]) -> Self {
+        Self(
+            candidates
+                .iter()
+                .enumerate()
+                .map(|(idx, cand)| (cand.alloc_info.ptr, idx))
+                .collect(),
+        )
+    }
+
+    /// The candidates `op` has as operands, in candidate order. By the contract of
+    /// [PromotableOpInterface::promotion_kind], no other candidate can be promoted at `op`.
+    fn used_by(&self, op: Ptr<Operation>, ctx: &Context) -> SmallVec<[usize; 2]> {
+        let mut used: SmallVec<[usize; 2]> = op
+            .deref(ctx)
+            .operands()
+            .filter_map(|opd| self.0.get(&opd).copied())
+            .collect();
+        used.sort_unstable();
+        used.dedup();
+        used
+    }
 }
 
 /// Compute per-candidate liveness anchors for mem2reg analysis.
@@ -453,6 +482,7 @@ fn process_rename_block(
     reaching_defs: &mut ReachingDefs,
     default_def_map: &mut HMap<Value, Value>,
     alloc_candidates: &[AllocCandidate],
+    index: &CandidateIndex,
 ) -> Result<()> {
     // Push phi args for this block.
     for &(ref cand, arg_idx) in new_phis_in_block.get(&block).into_iter().flatten() {
@@ -466,13 +496,17 @@ fn process_rename_block(
         if erased_ops.contains(&op) {
             continue;
         }
+        let used = index.used_by(op, ctx);
+        if used.is_empty() {
+            continue;
+        }
         let op_obj = Operation::get_op_dyn(op, ctx);
         let Some(piface) = op_cast::<dyn PromotableOpInterface>(op_obj.as_ref()) else {
             continue;
         };
 
         let mut promote_queue = Vec::new();
-        for cand in alloc_candidates {
+        for cand in used.into_iter().map(|cand_idx| &alloc_candidates[cand_idx]) {
             match piface.promotion_kind(ctx, &cand.alloc_info) {
                 PromotableOpKind::Load | PromotableOpKind::EliminatableUse => {
                     let current_def = reaching_defs.get_or_default(cand, ctx, default_def_map)?;
@@ -482,8 +516,8 @@ fn process_rename_block(
                     reaching_defs.set(cand.alloc_info.ptr, stored_val);
                     promote_queue.push((cand.alloc_info.clone(), stored_val));
                 }
-                // Intentionally no-op: this includes the common case where `op`
-                // does not use `cand.alloc_info.ptr` (required by the interface contract).
+                // Renaming can make a candidate an operand that `op` does not promote, such as
+                // the value of a store when a load of that candidate was replaced by it.
                 PromotableOpKind::NonPromotableUse => {}
             }
         }
@@ -532,6 +566,7 @@ fn rename_blocks(
     default_def_map: &mut HMap<Value, Value>,
     alloc_candidates: &[AllocCandidate],
 ) -> Result<()> {
+    let index = CandidateIndex::new(alloc_candidates);
     let mut reaching_defs = ReachingDefs::default();
     let mut worklist = vec![(entry_block, reaching_defs.checkpoint())];
 
@@ -544,6 +579,7 @@ fn rename_blocks(
             &mut reaching_defs,
             default_def_map,
             alloc_candidates,
+            &index,
         )?;
 
         let after_block = reaching_defs.checkpoint();

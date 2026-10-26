@@ -1084,3 +1084,37 @@ fn mem2reg_alloca_inside_loop_body() -> Result<()> {
         }"#]].assert_eq(&after);
     Ok(())
 }
+
+#[test]
+fn mem2reg_candidate_stored_into_candidate() -> Result<()> {
+    // Renaming replaces `x` with `a`, so the store to `c` gets `a` as an operand it does
+    // not promote.
+    let input = r#"
+    llvm.func @f: llvm.func <builtin.integer i64 () variadic = false> [] {
+      ^entry():
+      size = builtin.constant <builtin.integer <1: i64>> : builtin.integer i64;
+      a = llvm.alloca [llvm.ptr (0) x size] : llvm.ptr (0);
+      c = llvm.alloca [llvm.ptr (0) x size] : llvm.ptr (0);
+      llvm.store *a <- a;
+      x = llvm.load a : llvm.ptr (0);
+      llvm.store *c <- x;
+      y = llvm.load c : llvm.ptr (0);
+      zero = builtin.constant <builtin.integer <0: i64>> : builtin.integer i64;
+      llvm.return zero
+    }
+  "#;
+
+    let (status, after) = run_mem2reg(input)?;
+    assert_eq!(status, IRStatus::Changed);
+    expect![[r#"
+        llvm.func @f: llvm.func <builtin.integer i64() variadic = false>
+          [] 
+        {
+          ^entry_block1v1() !0:
+            size_v0 = builtin.constant <builtin.integer <1: i64>> : builtin.integer i64 !1;
+            zero_v5 = builtin.constant <builtin.integer <0: i64>> : builtin.integer i64 !2;
+            llvm.return zero_v5 !3
+        }"#]]
+    .assert_eq(&after);
+    Ok(())
+}
