@@ -7,6 +7,7 @@ use core::panic;
 
 use alloc::{rc::Rc, vec::Vec};
 use pliron_derive::op_interface;
+use smallvec::SmallVec;
 
 use crate::{
     basic_block::BasicBlock,
@@ -191,58 +192,55 @@ fn prune_candidates(candidates: &mut Vec<AllocCandidate>, ctx: &Context) {
     });
 }
 
-/// Compute per-candidate liveness anchors for mem2reg analysis.
+/// Maps each candidate's allocation pointer to its position in the candidate slice.
+struct CandidateIndex(HMap<Value, usize>);
+
+impl CandidateIndex {
+    fn new(candidates: &[AllocCandidate]) -> Self {
+        Self(
+            candidates
+                .iter()
+                .enumerate()
+                .map(|(idx, cand)| (cand.alloc_info.ptr, idx))
+                .collect(),
+        )
+    }
+
+    /// Get the candidates that `op` has as operands, in candidate order. By the contract of
+    /// [PromotableOpInterface::promotion_kind], no other candidate can be promoted at `op`.
+    fn used_by(&self, op: Ptr<Operation>, ctx: &Context) -> SmallVec<[usize; 2]> {
+        let mut used: SmallVec<[usize; 2]> = op
+            .deref(ctx)
+            .operands()
+            .filter_map(|opd| self.0.get(&opd).copied())
+            .collect();
+        used.sort_unstable();
+        used.dedup();
+        used
+    }
+}
+
+/// Compute per-candidate liveness anchors for mem2reg analysis, from the candidate's
+/// [BlockUse]s.
 ///
 /// Returns:
 /// - `live_in`: blocks where the candidate's value is live-in.
 /// - `defining_blocks`: blocks that contain a store defining the candidate.
 fn compute_candidate_live_in_and_defining_blocks(
     ctx: &Context,
-    cand: &AllocCandidate,
+    block_uses: &IMap<Ptr<BasicBlock>, BlockUse>,
 ) -> (HSet<Ptr<BasicBlock>>, ISet<Ptr<BasicBlock>>) {
-    let ptr = cand.alloc_info.ptr;
-
     let mut defining_blocks: ISet<Ptr<BasicBlock>> = ISet::default();
     let mut live_in: HSet<Ptr<BasicBlock>> = HSet::default();
     let mut live_in_worklist: Vec<Ptr<BasicBlock>> = Vec::new();
 
-    // Compute blocks that contain uses of this pointer.
-    let mut user_blocks: ISet<Ptr<BasicBlock>> = ISet::default();
-    for u in ptr.uses(ctx) {
-        if let Some(block) = u.user_op().deref(ctx).get_parent_block() {
-            user_blocks.insert(block);
-        }
-    }
-
     // A block is a defining block if it has any store to this candidate.
     // A block seeds liveness if it has a load/eliminatable use before the first store.
-    for block in user_blocks {
-        let mut has_store = false;
-        let mut load_before_store = false;
-        for op in block.iter(ctx) {
-            let op_obj = Operation::get_op_dyn(op, ctx);
-            let Some(op_promotable) = op_cast::<dyn PromotableOpInterface>(op_obj.as_ref()) else {
-                continue;
-            };
-            match op_promotable.promotion_kind(ctx, &cand.alloc_info) {
-                PromotableOpKind::Load | PromotableOpKind::EliminatableUse => {
-                    if !has_store {
-                        load_before_store = true;
-                    }
-                }
-                PromotableOpKind::Store(_) => {
-                    has_store = true;
-                }
-                PromotableOpKind::NonPromotableUse => {
-                    // Filtered by prune_candidates.
-                }
-            }
-        }
-
-        if has_store {
+    for (&block, block_use) in block_uses {
+        if block_use.has_store {
             defining_blocks.insert(block);
         }
-        if load_before_store {
+        if block_use.load_before_store {
             live_in_worklist.push(block);
         }
     }
@@ -260,6 +258,69 @@ fn compute_candidate_live_in_and_defining_blocks(
     }
 
     (live_in, defining_blocks)
+}
+
+/// How a candidate is used within one block.
+#[derive(Default)]
+struct BlockUse {
+    /// The block stores to the candidate.
+    has_store: bool,
+    /// A load or eliminatable use comes before the block's first store to the candidate.
+    load_before_store: bool,
+}
+
+/// Compute, for each candidate, its [BlockUse] in each block that uses it, in the order of
+/// its uses.
+fn compute_block_uses(
+    ctx: &Context,
+    candidates: &[AllocCandidate],
+) -> Vec<IMap<Ptr<BasicBlock>, BlockUse>> {
+    let index = CandidateIndex::new(candidates);
+    let mut block_uses: Vec<IMap<Ptr<BasicBlock>, BlockUse>> = Vec::with_capacity(candidates.len());
+    let mut user_blocks: ISet<Ptr<BasicBlock>> = ISet::default();
+    for cand in candidates {
+        let mut cand_uses = IMap::default();
+        for u in cand.alloc_info.ptr.uses(ctx) {
+            if let Some(block) = u.user_op().deref(ctx).get_parent_block() {
+                cand_uses.insert(block, BlockUse::default());
+                user_blocks.insert(block);
+            }
+        }
+        block_uses.push(cand_uses);
+    }
+
+    for block in user_blocks {
+        for op in block.iter(ctx) {
+            let used = index.used_by(op, ctx);
+            if used.is_empty() {
+                continue;
+            }
+            let op_obj = Operation::get_op_dyn(op, ctx);
+            let Some(op_promotable) = op_cast::<dyn PromotableOpInterface>(op_obj.as_ref()) else {
+                continue;
+            };
+            for cand_idx in used {
+                let block_use = block_uses[cand_idx]
+                    .get_mut(&block)
+                    .expect("Block using a candidate must be one of its user blocks");
+                match op_promotable.promotion_kind(ctx, &candidates[cand_idx].alloc_info) {
+                    PromotableOpKind::Load | PromotableOpKind::EliminatableUse => {
+                        if !block_use.has_store {
+                            block_use.load_before_store = true;
+                        }
+                    }
+                    PromotableOpKind::Store(_) => {
+                        block_use.has_store = true;
+                    }
+                    PromotableOpKind::NonPromotableUse => {
+                        // Filtered by prune_candidates.
+                    }
+                }
+            }
+        }
+    }
+
+    block_uses
 }
 
 /// Compute phi placement blocks for one candidate using liveness-pruned IDF.
@@ -587,11 +648,12 @@ pub fn mem2reg(
         let df_map = DomFrontierMap::new(ctx, &region, dom_tree);
 
         // Compute liveness and phi-placement per candidate.
+        let block_uses = compute_block_uses(ctx, &alloc_candidates);
         let mut phi_blocks: HMap<Value, ISet<Ptr<BasicBlock>>> = HMap::default();
-        for cand in alloc_candidates.iter() {
+        for (cand, block_uses) in alloc_candidates.iter().zip(&block_uses) {
             let ptr = cand.alloc_info.ptr;
             let (live_in, defining_blocks) =
-                compute_candidate_live_in_and_defining_blocks(ctx, cand);
+                compute_candidate_live_in_and_defining_blocks(ctx, block_uses);
             let candidate_phi_blocks =
                 compute_candidate_phi_blocks(&df_map, &live_in, &defining_blocks);
             phi_blocks.insert(ptr, candidate_phi_blocks);
