@@ -404,6 +404,58 @@ fn mem2reg_diamond_pattern() -> Result<()> {
 }
 
 #[test]
+fn mem2reg_store_does_not_reach_sibling_branch() -> Result<()> {
+    // Test that a store in one branch does not reach its sibling: each branch stores to the
+    // allocation the other one loads, so both loads must see the entry's stores.
+    let input = r#"
+    llvm.func @f: llvm.func <builtin.integer i64 (builtin.integer i1) variadic = false> [] {
+      ^entry(cond: builtin.integer i1):
+      size = builtin.constant <builtin.integer <1: i64>> : builtin.integer i64;
+      a = llvm.alloca [builtin.integer i64 x size] : llvm.ptr (0);
+      b = llvm.alloca [builtin.integer i64 x size] : llvm.ptr (0);
+      zero = builtin.constant <builtin.integer <0: i64>> : builtin.integer i64;
+      llvm.store *a <- zero;
+      llvm.store *b <- zero;
+      llvm.cond_br if cond ^then() else ^else()
+
+      ^then():
+      one = builtin.constant <builtin.integer <1: i64>> : builtin.integer i64;
+      llvm.store *a <- one;
+      loaded_b = llvm.load b : builtin.integer i64;
+      llvm.return loaded_b
+
+      ^else():
+      two = builtin.constant <builtin.integer <2: i64>> : builtin.integer i64;
+      llvm.store *b <- two;
+      loaded_a = llvm.load a : builtin.integer i64;
+      llvm.return loaded_a
+    }
+  "#;
+
+    let (status, after) = run_mem2reg(input)?;
+    assert_eq!(status, IRStatus::Changed);
+    expect![[r#"
+        llvm.func @f: llvm.func <builtin.integer i64(builtin.integer i1) variadic = false>
+          [] 
+        {
+          ^entry_block1v1(cond_v0: builtin.integer i1) !0:
+            size_v1 = builtin.constant <builtin.integer <1: i64>> : builtin.integer i64 !1;
+            zero_v4 = builtin.constant <builtin.integer <0: i64>> : builtin.integer i64 !2;
+            llvm.cond_br if cond_v0 ^then_block4v1() else ^else_block2v3() !3
+
+          ^then_block4v1() !4:
+            one_v5 = builtin.constant <builtin.integer <1: i64>> : builtin.integer i64 !5;
+            llvm.return zero_v4 !6
+
+          ^else_block2v3() !7:
+            two_v7 = builtin.constant <builtin.integer <2: i64>> : builtin.integer i64 !8;
+            llvm.return zero_v4 !9
+        }"#]]
+    .assert_eq(&after);
+    Ok(())
+}
+
+#[test]
 fn mem2reg_nested_branches() -> Result<()> {
     // Test nested if-then-else structures.
     let input = r#"
