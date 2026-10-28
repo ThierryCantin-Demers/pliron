@@ -68,7 +68,7 @@ pub trait PromotableAllocationInterface {
     ) -> Result<Value>;
 
     /// Promote allocations. This is called after all uses have been promoted,
-    /// and should remove the allocation (not necessary the operation itself) from the IR.
+    /// and should remove the allocation (not necessarily the operation itself) from the IR.
     /// The `alloc_info`s passed are guaranteed to be from the entries returned by `alloc_info`.
     /// The rewriter is set to insert before this alloc op.
     fn promote(
@@ -196,43 +196,42 @@ fn prune_candidates(candidates: &mut Vec<AllocCandidate>, ctx: &Context) {
     });
 }
 
-/// Maps each candidate's allocation pointer to its position in the candidate slice.
-struct CandidateIndex(HMap<Value, usize>);
+/// Maps each `alloc_info.ptr` in a given `&[AllocCandidate]` to its index in that slice.
+struct CandidateIndexMap(HMap<Value, usize>);
 
-impl CandidateIndex {
+impl CandidateIndexMap {
+    /// Compute a map of every `alloc_info.ptr` to its index in `candidates`.
     fn new(candidates: &[AllocCandidate]) -> Self {
         Self(
             candidates
                 .iter()
                 .enumerate()
-                .map(|(idx, cand)| (cand.alloc_info.ptr, idx))
+                .map(|(cand_idx, cand)| (cand.alloc_info.ptr, cand_idx))
                 .collect(),
         )
     }
 
-    /// Get the candidates that `op` has as operands, in candidate order. By the contract of
-    /// [PromotableOpInterface::promotion_kind], no other candidate can be promoted at `op`.
-    fn used_by(&self, op: Ptr<Operation>, ctx: &Context) -> SmallVec<[usize; 2]> {
-        let mut used: SmallVec<[usize; 2]> = op
+    /// Get the indices of the candidates that `op` uses, in ascending order.
+    fn candidates_accessed_by_op(&self, op: Ptr<Operation>, ctx: &Context) -> SmallVec<[usize; 2]> {
+        let mut accessed_cands: SmallVec<[usize; 2]> = op
             .deref(ctx)
             .operands()
             .filter_map(|opd| self.0.get(&opd).copied())
             .collect();
-        used.sort_unstable();
-        used.dedup();
-        used
+        accessed_cands.sort_unstable();
+        accessed_cands.dedup();
+        accessed_cands
     }
 }
 
-/// Compute per-candidate liveness anchors for mem2reg analysis, from the candidate's
-/// [BlockUse]s.
+/// Compute per-candidate liveness anchors for mem2reg analysis.
 ///
 /// Returns:
 /// - `live_in`: blocks where the candidate's value is live-in.
 /// - `defining_blocks`: blocks that contain a store defining the candidate.
 fn compute_candidate_live_in_and_defining_blocks(
     ctx: &Context,
-    block_uses: &IMap<Ptr<BasicBlock>, BlockUse>,
+    cand_user_blocks_info: &IMap<Ptr<BasicBlock>, CandidateUserBlockInfo>,
 ) -> (HSet<Ptr<BasicBlock>>, ISet<Ptr<BasicBlock>>) {
     let mut defining_blocks: ISet<Ptr<BasicBlock>> = ISet::default();
     let mut live_in: HSet<Ptr<BasicBlock>> = HSet::default();
@@ -240,11 +239,11 @@ fn compute_candidate_live_in_and_defining_blocks(
 
     // A block is a defining block if it has any store to this candidate.
     // A block seeds liveness if it has a load/eliminatable use before the first store.
-    for (&block, block_use) in block_uses {
-        if block_use.has_store {
+    for (&block, info) in cand_user_blocks_info {
+        if info.has_store {
             defining_blocks.insert(block);
         }
-        if block_use.load_before_store {
+        if info.load_before_store {
             live_in_worklist.push(block);
         }
     }
@@ -264,67 +263,64 @@ fn compute_candidate_live_in_and_defining_blocks(
     (live_in, defining_blocks)
 }
 
-/// How a candidate is used within one block.
+/// Summary of the accesses to a candidate within one of its user blocks.
 #[derive(Default)]
-struct BlockUse {
+struct CandidateUserBlockInfo {
     /// The block stores to the candidate.
     has_store: bool,
-    /// A load or eliminatable use comes before the block's first store to the candidate.
+    /// The block uses the candidate's value before storing to it.
     load_before_store: bool,
 }
 
-/// Compute, for each candidate, its [BlockUse] in each block that uses it, in the order of
-/// its uses.
-fn compute_block_uses(
+/// Map each candidate in `candidates` to its user blocks info:
+/// a [CandidateUserBlockInfo] for each of its user blocks.
+fn compute_user_blocks_info(
     ctx: &Context,
     candidates: &[AllocCandidate],
-) -> Vec<IMap<Ptr<BasicBlock>, BlockUse>> {
-    let index = CandidateIndex::new(candidates);
-    let mut block_uses: Vec<IMap<Ptr<BasicBlock>, BlockUse>> = Vec::with_capacity(candidates.len());
+) -> Vec<IMap<Ptr<BasicBlock>, CandidateUserBlockInfo>> {
+    let cand_index_map = CandidateIndexMap::new(candidates);
     let mut user_blocks: ISet<Ptr<BasicBlock>> = ISet::default();
     for cand in candidates {
-        let mut cand_uses = IMap::default();
         for u in cand.alloc_info.ptr.uses(ctx) {
             if let Some(block) = u.user_op().deref(ctx).get_parent_block() {
-                cand_uses.insert(block, BlockUse::default());
                 user_blocks.insert(block);
             }
         }
-        block_uses.push(cand_uses);
     }
 
+    let mut user_blocks_info: Vec<IMap<Ptr<BasicBlock>, CandidateUserBlockInfo>> =
+        (0..candidates.len()).map(|_| IMap::default()).collect();
     for block in user_blocks {
         for op in block.iter(ctx) {
-            let used = index.used_by(op, ctx);
-            if used.is_empty() {
+            let accessed_cands = cand_index_map.candidates_accessed_by_op(op, ctx);
+            if accessed_cands.is_empty() {
                 continue;
             }
             let op_obj = Operation::get_op_dyn(op, ctx);
-            let Some(op_promotable) = op_cast::<dyn PromotableOpInterface>(op_obj.as_ref()) else {
-                continue;
-            };
-            for cand_idx in used {
-                let block_use = block_uses[cand_idx]
-                    .get_mut(&block)
-                    .expect("Block using a candidate must be one of its user blocks");
+            let op_promotable = op_cast::<dyn PromotableOpInterface>(op_obj.as_ref())
+                .expect("User op of a candidate must implement PromotableOpInterface");
+            for cand_idx in accessed_cands {
+                let info = user_blocks_info[cand_idx].entry(block).or_default();
                 match op_promotable.promotion_kind(ctx, &candidates[cand_idx].alloc_info) {
                     PromotableOpKind::Load | PromotableOpKind::EliminatableUse => {
-                        if !block_use.has_store {
-                            block_use.load_before_store = true;
+                        if !info.has_store {
+                            info.load_before_store = true;
                         }
                     }
                     PromotableOpKind::Store(_) => {
-                        block_use.has_store = true;
+                        info.has_store = true;
                     }
                     PromotableOpKind::NonPromotableUse => {
-                        // Filtered by prune_candidates.
+                        unreachable!(
+                            "prune_candidates removes candidates with a non-promotable use"
+                        )
                     }
                 }
             }
         }
     }
 
-    block_uses
+    user_blocks_info
 }
 
 /// Compute phi placement blocks for one candidate using liveness-pruned IDF.
@@ -469,6 +465,10 @@ struct RenameState<'a> {
     renames_in_block: Vec<(Ptr<BasicBlock>, Value)>,
     /// The default value (if already created) for each promotable allocation pointer.
     default_def_map: HMap<Value, Value>,
+    /// The candidates being promoted.
+    alloc_candidates: &'a [AllocCandidate],
+    /// Finds the candidates (as indices in [Self::alloc_candidates]) that an op uses.
+    cand_index_map: CandidateIndexMap,
 }
 
 impl RenameState<'_> {
@@ -511,8 +511,8 @@ fn process_rename_block(
     state: &mut RenameState,
     block: Ptr<BasicBlock>,
     new_phis_in_block: &HMap<Ptr<BasicBlock>, Vec<(AllocCandidate, usize)>>,
-    alloc_candidates: &[AllocCandidate],
 ) -> Result<()> {
+    let alloc_candidates = state.alloc_candidates;
     // Push phi args for this block.
     for &(ref cand, arg_idx) in new_phis_in_block.get(&block).into_iter().flatten() {
         let new_val = block.deref(state.ctx).get_argument(arg_idx);
@@ -525,13 +525,19 @@ fn process_rename_block(
         if erased_ops.contains(&op) {
             continue;
         }
-        let op_obj = Operation::get_op_dyn(op, state.ctx);
-        let Some(piface) = op_cast::<dyn PromotableOpInterface>(op_obj.as_ref()) else {
+        let accessed_cands = state
+            .cand_index_map
+            .candidates_accessed_by_op(op, state.ctx);
+        if accessed_cands.is_empty() {
             continue;
-        };
+        }
+        let op_obj = Operation::get_op_dyn(op, state.ctx);
+        let piface = op_cast::<dyn PromotableOpInterface>(op_obj.as_ref())
+            .expect("User op of a candidate must implement PromotableOpInterface");
 
         let mut promote_queue = Vec::new();
-        for cand in alloc_candidates {
+        for cand_idx in accessed_cands {
+            let cand = &alloc_candidates[cand_idx];
             match piface.promotion_kind(state.ctx, &cand.alloc_info) {
                 PromotableOpKind::Load | PromotableOpKind::EliminatableUse => {
                     let current_def = state.current_def(cand)?;
@@ -541,9 +547,9 @@ fn process_rename_block(
                     state.push_def(block, cand.alloc_info.ptr, stored_val);
                     promote_queue.push((cand.alloc_info.clone(), stored_val));
                 }
-                // Intentionally no-op: this includes the common case where `op`
-                // does not use `cand.alloc_info.ptr` (required by the interface contract).
-                PromotableOpKind::NonPromotableUse => {}
+                PromotableOpKind::NonPromotableUse => {
+                    unreachable!("prune_candidates removes candidates with a non-promotable use")
+                }
             }
         }
         if !promote_queue.is_empty() {
@@ -572,7 +578,6 @@ fn process_rename_block(
         for &(ref cand, arg_idx) in new_phis_in_succ {
             let current_def = state.current_def(cand)?;
             let succ_opd_idx = branch_iface.add_successor_operand(state.ctx, succ_idx, current_def);
-            // The operand index returned by add_successor_operand should match the phi argument index.
             assert!(succ_opd_idx == arg_idx, "Mismatched phi argument index");
         }
     }
@@ -600,13 +605,14 @@ fn rename_blocks(
         reaching_defs,
         renames_in_block: Vec::new(),
         default_def_map: HMap::default(),
+        alloc_candidates,
+        cand_index_map: CandidateIndexMap::new(alloc_candidates),
     };
 
     let res = dom_tree.walk(
         &mut state,
         Direction::Forward,
-        |state, block| match process_rename_block(state, block, new_phis_in_block, alloc_candidates)
-        {
+        |state, block| match process_rename_block(state, block, new_phis_in_block) {
             Ok(()) => walk_advance(),
             Err(err) => walk_break(err),
         },
@@ -661,12 +667,12 @@ pub fn mem2reg(
         let df_map = DomFrontierMap::new(ctx, &region, dom_tree);
 
         // Compute liveness and phi-placement per candidate.
-        let block_uses = compute_block_uses(ctx, &alloc_candidates);
+        let user_blocks_info = compute_user_blocks_info(ctx, &alloc_candidates);
         let mut phi_blocks: HMap<Value, ISet<Ptr<BasicBlock>>> = HMap::default();
-        for (cand, block_uses) in alloc_candidates.iter().zip(&block_uses) {
+        for (cand, cand_user_blocks_info) in alloc_candidates.iter().zip(&user_blocks_info) {
             let ptr = cand.alloc_info.ptr;
             let (live_in, defining_blocks) =
-                compute_candidate_live_in_and_defining_blocks(ctx, block_uses);
+                compute_candidate_live_in_and_defining_blocks(ctx, cand_user_blocks_info);
             let candidate_phi_blocks =
                 compute_candidate_phi_blocks(&df_map, &live_in, &defining_blocks);
             phi_blocks.insert(ptr, candidate_phi_blocks);
